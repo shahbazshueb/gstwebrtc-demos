@@ -24,6 +24,7 @@ var send_channel;
 var ws_conn;
 // Promise for local stream after constraints are approved by the user
 var local_stream_promise;
+var didhandshake =  false;
 
 function getOurId() {
     return Math.floor(Math.random() * (9000 - 10) + 10).toString();
@@ -76,17 +77,38 @@ function resetVideo() {
 
 // SDP offer received from peer, set remote description and create an answer
 function onIncomingSDP(sdp) {
+    console.log(sdp)
     peer_connection.setRemoteDescription(sdp).then(() => {
         setStatus("Remote SDP set");
-        if (sdp.type != "offer")
+        if (sdp.type != "answer")
             return;
-        setStatus("Got SDP offer");
-        local_stream_promise.then((stream) => {
-            setStatus("Got local stream, creating answer");
-            peer_connection.createAnswer()
-            .then(onLocalDescription).catch(setError);
-        }).catch(setError);
+        setStatus("Got SDP answer");
+        didhandshake = true;
+        // local_stream_promise.then((stream) => {
+        //     setStatus("Got local stream, creating answer");
+        //     peer_connection.createAnswer()
+        //     .then(onLocalDescription).catch(setError);
+        // }).catch(setError);
     }).catch(setError);
+}
+
+function onNegotiationNeeded() {
+    peer_connection.createOffer()
+    .then(offer => {
+        
+        // let newSdp = offer.sdp.replace("minptime=10;useinbandfec=1", "sprop-maxcapturerate=8000;sprop-stereo=0")
+        // // newSdp = newSdp.replace("mid:0", "mid:audio0")
+        // offer.sdp = newSdp;
+        return peer_connection.setLocalDescription(offer)
+    })
+    .then(() => {
+        console.log('Offer created');
+        console.log(peer_connection.localDescription.sdp)
+        
+        setStatus("Sending SDP offer");
+        sdp = {'sdp': peer_connection.localDescription}
+        ws_conn.send(JSON.stringify(sdp));
+    });
 }
 
 // Local description was set, send it to peer
@@ -101,8 +123,22 @@ function onLocalDescription(desc) {
 
 // ICE candidate received from peer, add it to the peer connection
 function onIncomingICE(ice) {
-    var candidate = new RTCIceCandidate(ice);
-    peer_connection.addIceCandidate(candidate).catch(setError);
+    
+    return new Promise(resolve => {
+        const waitForConnection = () => {
+            if (didhandshake) {
+                return resolve();
+            }
+            setTimeout(waitForConnection, 500);
+        };
+
+        return waitForConnection();
+    })
+        .then(() => {
+            var candidate = new RTCIceCandidate(ice);
+            return peer_connection.addIceCandidate(candidate).catch(setError);
+
+        });
 }
 
 function onServerMessage(event) {
@@ -127,10 +163,6 @@ function onServerMessage(event) {
                 }
                 return;
             }
-
-            // Incoming JSON signals the beginning of a call
-            if (!peer_connection)
-                createCall(msg);
 
             if (msg.sdp != null) {
                 onIncomingSDP(msg.sdp);
@@ -175,6 +207,10 @@ function getLocalStream() {
 
     // Add local stream
     if (navigator.mediaDevices.getUserMedia) {
+        const constraints = {
+            video: true,
+            audio: true
+        };
         return navigator.mediaDevices.getUserMedia(constraints);
     } else {
         errorUserMediaHandler();
@@ -217,6 +253,11 @@ function websocketServerConnect() {
     ws_conn.addEventListener('error', onServerError);
     ws_conn.addEventListener('message', onServerMessage);
     ws_conn.addEventListener('close', onServerClose);
+
+    setTimeout(() => {
+        console.log("CREATING CALL")
+        createCall()
+    }, 10000)
 }
 
 function onRemoteTrack(event) {
@@ -272,33 +313,50 @@ function createCall(msg) {
     console.log('Creating RTCPeerConnection');
 
     peer_connection = new RTCPeerConnection(rtc_configuration);
-    send_channel = peer_connection.createDataChannel('label', null);
-    send_channel.onopen = handleDataChannelOpen;
-    send_channel.onmessage = handleDataChannelMessageReceived;
-    send_channel.onerror = handleDataChannelError;
-    send_channel.onclose = handleDataChannelClose;
-    peer_connection.ondatachannel = onDataChannel;
+    // send_channel = peer_connection.createDataChannel('label', null);
+    // send_channel.onopen = handleDataChannelOpen;
+    // send_channel.onmessage = handleDataChannelMessageReceived;
+    // send_channel.onerror = handleDataChannelError;
+    // send_channel.onclose = handleDataChannelClose;
+    // peer_connection.ondatachannel = onDataChannel;
     peer_connection.ontrack = onRemoteTrack;
+    peer_connection.onnegotiationneeded = onNegotiationNeeded;
     /* Send our video/audio to the other peer */
-    local_stream_promise = getLocalStream().then((stream) => {
+    getLocalStream().then((stream) => {
         console.log('Adding local stream');
         peer_connection.addStream(stream);
         return stream;
     }).catch(setError);
 
-    if (!msg.sdp) {
-        console.log("WARNING: First message wasn't an SDP message!?");
-    }
+
+
+    // if (!msg.sdp) {
+    //     console.log("WARNING: First message wasn't an SDP message!?");
+    // }
 
     peer_connection.onicecandidate = (event) => {
-	// We have a candidate, send it to the remote party with the
-	// same uuid
-	if (event.candidate == null) {
+	    // We have a candidate, send it to the remote party with the
+	    // same uuid
+	    if (event.candidate == null) {
             console.log("ICE Candidate was null, done");
             return;
-	}
-	ws_conn.send(JSON.stringify({'ice': event.candidate}));
+        }
+        
+        return new Promise(resolve => {
+            const waitForConnection = () => {
+                if (peer_connection && didhandshake) {
+                    return resolve();
+                }
+                setTimeout(waitForConnection, 500);
+            };
+
+            return waitForConnection();
+        })
+            .then(() => {
+                ws_conn.send(JSON.stringify({'ice': event.candidate}));
+            });
+	    
     };
 
-    setStatus("Created peer connection for call, waiting for SDP");
+    setStatus("Created peer connection for call and offer sent, waiting for Answer");
 }
